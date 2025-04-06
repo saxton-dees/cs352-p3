@@ -67,28 +67,129 @@ struct avail *buddy_calc(struct buddy_pool *pool, struct avail *buddy)
     return (struct avail *)(pool->base + buddy_offset);
 }
 
+/**
+ * @brief Allocate memory using the buddy system.
+ *
+ * @param pool The memory pool to allocate from
+ * @param size The size of memory to allocate
+ * @return Pointer to the allocated memory, or NULL if allocation fails
+ */
 void *buddy_malloc(struct buddy_pool *pool, size_t size)
 {
-
     //get the kval for the requested size with enough room for the tag and kval fields
-
     //R1 Find a block
-
     //There was not enough memory to satisfy the request thus we need to set error and return NULL
-
     //R2 Remove from list;
-
     //R3 Split required?
-
     //R4 Split the block
 
+    if (pool == NULL || size == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    // Step 1: Calculate the required kval
+    size_t required_kval = btok(size + sizeof(struct avail));
+    if (required_kval < SMALLEST_K) {
+        required_kval = SMALLEST_K;
+    }
+
+    // Step 2: Find a suitable block
+    size_t current_kval = required_kval;
+    while (current_kval <= pool->kval_m && pool->avail[current_kval].next == &pool->avail[current_kval]) {
+        current_kval++;
+    }
+
+    // If no suitable block is found, return NULL
+    if (current_kval > pool->kval_m) {
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    // Step 3: Remove the block from the free list
+    struct avail *block = pool->avail[current_kval].next;
+    block->prev->next = block->next;
+    block->next->prev = block->prev;
+
+    // Step 4: Split the block (if necessary)
+    while (current_kval > required_kval) {
+        current_kval--;
+        size_t block_size = (size_t)1 << current_kval;
+
+        // Calculate the buddy of the block
+        struct avail *buddy = (struct avail *)((void *)block + block_size);
+
+        // Initialize the buddy block
+        buddy->kval = current_kval;
+        buddy->tag = BLOCK_AVAIL;
+
+        // Add the buddy to the free list
+        buddy->next = pool->avail[current_kval].next;
+        buddy->prev = &pool->avail[current_kval];
+        pool->avail[current_kval].next->prev = buddy;
+        pool->avail[current_kval].next = buddy;
+    }
+
+    // Step 5: Mark the block as reserved
+    block->tag = BLOCK_RESERVED;
+    block->kval = required_kval;
+
+    // Return a pointer to the memory region after the metadata
+    return (void *)(block + 1);
 }
 
+/**
+ * @brief Free a previously allocated memory block.
+ *
+ * @param pool The memory pool to free from
+ * @param ptr Pointer to the memory block to free
+ */
 void buddy_free(struct buddy_pool *pool, void *ptr)
 {
+    if (pool == NULL || ptr == NULL) {
+        return; // Do nothing if pool or ptr is NULL
+    }
 
+    // Step 1: Locate the block metadata
+    struct avail *block = (struct avail *)ptr - 1;
+
+    // Step 2: Mark the block as available
+    block->tag = BLOCK_AVAIL;
+
+    // Step 3: Attempt to merge with buddy
+    while (block->kval < pool->kval_m) {
+        struct avail *buddy = buddy_calc(pool, block);
+
+        // Check if the buddy is free and has the same kval
+        if (buddy->tag != BLOCK_AVAIL || buddy->kval != block->kval) {
+            break; // Stop merging if buddy is not free or not the same size
+        }
+
+        // Remove the buddy from the free list
+        buddy->prev->next = buddy->next;
+        buddy->next->prev = buddy->prev;
+
+        // Merge the block and buddy into a larger block
+        if (buddy < block) {
+            block = buddy; // The merged block starts at the lower address
+        }
+        block->kval++;
+    }
+
+    // Step 4: Add the resulting block to the free list
+    block->next = pool->avail[block->kval].next;
+    block->prev = &pool->avail[block->kval];
+    pool->avail[block->kval].next->prev = block;
+    pool->avail[block->kval].next = block;
 }
 
+
+/**
+ * @brief Initialize the buddy memory pool.
+ *
+ * @param pool The memory pool to initialize
+ * @param size The size of the memory pool in bytes
+ */
 void buddy_init(struct buddy_pool *pool, size_t size)
 {
     size_t kval = 0;
@@ -138,6 +239,11 @@ void buddy_init(struct buddy_pool *pool, size_t size)
     m->next = m->prev = &pool->avail[kval];
 }
 
+/**
+ * @brief Destroy the buddy memory pool and free the resources.
+ *
+ * @param pool The memory pool to destroy
+ */
 void buddy_destroy(struct buddy_pool *pool)
 {
     int rval = munmap(pool->base, pool->numbytes);
